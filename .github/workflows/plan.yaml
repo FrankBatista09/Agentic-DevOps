@@ -1,0 +1,92 @@
+name: Terraform Plan
+
+on:
+  pull_request:
+    branches:
+      - devel
+      - stage
+
+# No default token permissions; the job below declares what it needs.
+permissions: {}
+
+# One plan at a time per PR. Never cancel a running plan: an interrupted run can leave the
+# state blob lease held and block the next run.
+concurrency:
+  group: plan-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+env:
+  # Application directory relative to the repository root.
+  # The only line that differs between the root workflow and its nested twin.
+  APP_DIR: codebase/rdicidr-0.1.0
+
+jobs:
+  plan:
+    name: Terraform plan
+    # Fork PRs get no OIDC token and no variables: skip them (a skipped job counts as passing).
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    # No `environment:` on purpose: a plan must not wait for an approval.
+    # The OIDC subject is therefore repo:<owner>/<repo>:pull_request.
+    permissions:
+      id-token: write
+      contents: read
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ env.APP_DIR }}/terraform
+    env:
+      # The PR base branch names the target environment (devel or stage).
+      TF_ENV: ${{ github.base_ref }}
+      ARM_USE_OIDC: "true"
+      ARM_USE_AZUREAD: "true"
+      ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      TF_IN_AUTOMATION: "true"
+      TF_INPUT: "false"
+      TF_VAR_environment: ${{ github.base_ref }}
+      TF_VAR_image_tag: ${{ github.sha }}
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: 1.17.1
+          terraform_wrapper: false
+
+      - name: Terraform format check
+        run: terraform fmt -check -recursive -diff
+
+      - name: Terraform init
+        env:
+          TF_STATE_RESOURCE_GROUP: ${{ vars.TF_STATE_RESOURCE_GROUP }}
+          TF_STATE_STORAGE_ACCOUNT: ${{ vars.TF_STATE_STORAGE_ACCOUNT }}
+          TF_STATE_CONTAINER: ${{ vars.TF_STATE_CONTAINER }}
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${TF_STATE_RESOURCE_GROUP}" \
+            -backend-config="storage_account_name=${TF_STATE_STORAGE_ACCOUNT}" \
+            -backend-config="container_name=${TF_STATE_CONTAINER}" \
+            -backend-config="key=rdicidr-${TF_ENV}.tfstate" \
+            -backend-config="use_oidc=true" \
+            -backend-config="use_azuread_auth=true"
+
+      - name: Terraform validate
+        run: terraform validate
+
+      - name: Terraform plan
+        run: terraform plan -no-color -lock-timeout=10m -out=tfplan | tee plan.txt
+
+      - name: Publish plan to the job summary
+        if: always()
+        run: |
+          {
+            echo "### Terraform plan for ${TF_ENV}"
+            echo '~~~'
+            tail -c 60000 plan.txt 2>/dev/null || echo "No plan output."
+            echo '~~~'
+          } >> "$GITHUB_STEP_SUMMARY"

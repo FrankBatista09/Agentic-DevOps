@@ -1,0 +1,157 @@
+name: CD Pipeline
+
+on:
+  push:
+    branches:
+      - devel
+      - stage
+
+# No default token permissions; each job declares what it needs.
+permissions: {}
+
+# One deployment at a time per environment. Never cancel: a cancelled terraform apply can
+# corrupt or lock the state. Newer runs wait in the queue.
+concurrency:
+  group: cd-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  # Application directory relative to the repository root.
+  # The only line that differs between the root workflow and its nested twin.
+  APP_DIR: codebase/rdicidr-0.1.0
+
+jobs:
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    # The branch name equals the GitHub environment name (devel or stage).
+    # Gives the approval gate and the OIDC subject repo:<owner>/<repo>:environment:<name>.
+    environment: ${{ github.ref_name }}
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      gateway_url: ${{ steps.export.outputs.gateway_url }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ env.APP_DIR }}/terraform
+    env:
+      TF_ENV: ${{ github.ref_name }}
+      ARM_USE_OIDC: "true"
+      ARM_USE_AZUREAD: "true"
+      ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      TF_IN_AUTOMATION: "true"
+      TF_INPUT: "false"
+      TF_VAR_environment: ${{ github.ref_name }}
+      TF_VAR_image_tag: ${{ github.sha }}
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Azure login (OIDC)
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: 1.17.1
+          terraform_wrapper: false
+
+      - name: Terraform init
+        env:
+          TF_STATE_RESOURCE_GROUP: ${{ vars.TF_STATE_RESOURCE_GROUP }}
+          TF_STATE_STORAGE_ACCOUNT: ${{ vars.TF_STATE_STORAGE_ACCOUNT }}
+          TF_STATE_CONTAINER: ${{ vars.TF_STATE_CONTAINER }}
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${TF_STATE_RESOURCE_GROUP}" \
+            -backend-config="storage_account_name=${TF_STATE_STORAGE_ACCOUNT}" \
+            -backend-config="container_name=${TF_STATE_CONTAINER}" \
+            -backend-config="key=rdicidr-${TF_ENV}.tfstate" \
+            -backend-config="use_oidc=true" \
+            -backend-config="use_azuread_auth=true"
+
+      # Chicken and egg, step 1: the registry (and the AcrPull role of the app identity,
+      # which needs time to propagate) must exist before an image can be built.
+      - name: Terraform apply (registry and pull access only)
+        run: |
+          terraform apply -auto-approve -lock-timeout=10m \
+            -target=azurerm_resource_group.main \
+            -target=azurerm_container_registry.main \
+            -target=azurerm_user_assigned_identity.app \
+            -target=azurerm_role_assignment.acr_pull
+
+      - name: Read registry name
+        id: acr
+        run: echo "name=$(terraform output -raw acr_name)" >> "$GITHUB_OUTPUT"
+
+      # Step 2: build the image inside ACR (ACR Tasks). Needs no Docker daemon and no AcrPush role.
+      - name: Build and push image (ACR Tasks)
+        env:
+          ACR_NAME: ${{ steps.acr.outputs.name }}
+        run: |
+          az acr build \
+            --registry "${ACR_NAME}" \
+            --image "rdicidr:${GITHUB_SHA}" \
+            --file "${GITHUB_WORKSPACE}/${APP_DIR}/Dockerfile" \
+            "${GITHUB_WORKSPACE}/${APP_DIR}"
+
+      # Step 3: full apply, now that the image exists. The plan is saved so exactly it is applied.
+      - name: Terraform plan
+        run: terraform plan -no-color -lock-timeout=10m -out=tfplan
+
+      - name: Terraform apply
+        run: terraform apply -no-color -lock-timeout=10m tfplan
+
+      - name: Export gateway URL
+        id: export
+        run: |
+          url="$(terraform output -raw gateway_url)"
+          if [[ ! "${url}" =~ ^https?://[A-Za-z0-9.-]+(:[0-9]+)?/?$ ]]; then
+            echo "::error::Terraform output gateway_url is missing or malformed."
+            exit 1
+          fi
+          echo "gateway_url=${url%/}" >> "$GITHUB_OUTPUT"
+          echo "Gateway URL: ${url%/}"
+
+  smoke-test:
+    name: Smoke test
+    needs: [deploy]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # Plain HTTP checks only: no Azure login, no checkout, no environment (so no second approval).
+    permissions: {}
+    env:
+      GATEWAY_URL: ${{ needs.deploy.outputs.gateway_url }}
+      MAX_ATTEMPTS: "30"
+      SLEEP_SECONDS: "10"
+    steps:
+      - name: Check the application through the Application Gateway
+        shell: bash
+        run: |
+          set -u
+          failed=0
+          for path in "/" "/health"; do
+            ok=0
+            code=000
+            for attempt in $(seq 1 "${MAX_ATTEMPTS}"); do
+              code="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+                --connect-timeout 5 --max-time 15 "${GATEWAY_URL}${path}" || true)"
+              echo "GET ${path} attempt ${attempt}/${MAX_ATTEMPTS}: HTTP ${code}"
+              if [ "${code}" = "200" ]; then ok=1; break; fi
+              sleep "${SLEEP_SECONDS}"
+            done
+            if [ "${ok}" -ne 1 ]; then
+              echo "::error::GET ${path} did not return 200 after ${MAX_ATTEMPTS} attempts (last status ${code})."
+              failed=1
+            fi
+          done
+          exit "${failed}"
