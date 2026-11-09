@@ -8,6 +8,7 @@ test("renders learn react link", () => {
 });
 
 test("displays the API endpoint URL", () => {
+  process.env.REACT_APP_API_URL = "http://localhost:8080";
   render(<App />);
   const apiUrlElement = screen.getByTestId("api-url");
   expect(apiUrlElement).toHaveTextContent(process.env.REACT_APP_API_URL);

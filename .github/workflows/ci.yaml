@@ -1,0 +1,137 @@
+name: CI Pipeline
+
+on:
+  pull_request:
+    branches:
+      - devel
+      - stage
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  # Application directory relative to the repository root.
+  # The only line that differs between the root workflow and its nested twin.
+  APP_DIR: codebase/rdicidr-0.1.0
+
+jobs:
+  install:
+    name: Install
+    # Head/base policy: feature/* and bugfix/* into devel, devel into stage.
+    # A skipped job counts as passing for required checks (the workflow itself always starts).
+    if: >-
+      (github.base_ref == 'devel' &&
+        (startsWith(github.head_ref, 'feature/') || startsWith(github.head_ref, 'bugfix/'))) ||
+      (github.base_ref == 'stage' && github.head_ref == 'devel')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: ${{ env.APP_DIR }}
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: ${{ env.APP_DIR }}/.nvmrc
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Save node_modules
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.APP_DIR }}/node_modules
+          key: node-modules-${{ runner.os }}-${{ hashFiles(format('{0}/package-lock.json', env.APP_DIR), format('{0}/.nvmrc', env.APP_DIR)) }}
+
+  lint:
+    name: Lint
+    needs: [install]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: ${{ env.APP_DIR }}
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: ${{ env.APP_DIR }}/.nvmrc
+
+      - name: Restore node_modules
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.APP_DIR }}/node_modules
+          key: node-modules-${{ runner.os }}-${{ hashFiles(format('{0}/package-lock.json', env.APP_DIR), format('{0}/.nvmrc', env.APP_DIR)) }}
+          fail-on-cache-miss: true
+
+      - name: Run linter
+        run: npm run lint
+
+      - name: Check formatting
+        run: npm run prettier
+
+  test:
+    name: Test
+    needs: [lint]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: ${{ env.APP_DIR }}
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: ${{ env.APP_DIR }}/.nvmrc
+
+      - name: Restore node_modules
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.APP_DIR }}/node_modules
+          key: node-modules-${{ runner.os }}-${{ hashFiles(format('{0}/package-lock.json', env.APP_DIR), format('{0}/.nvmrc', env.APP_DIR)) }}
+          fail-on-cache-miss: true
+
+      - name: Run tests
+        env:
+          CI: true
+        run: npm test
+
+  build:
+    name: Build
+    needs: [test]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: ${{ env.APP_DIR }}
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: ${{ env.APP_DIR }}/.nvmrc
+
+      - name: Restore node_modules
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.APP_DIR }}/node_modules
+          key: node-modules-${{ runner.os }}-${{ hashFiles(format('{0}/package-lock.json', env.APP_DIR), format('{0}/.nvmrc', env.APP_DIR)) }}
+          fail-on-cache-miss: true
+
+      - name: Build project
+        run: npm run build
