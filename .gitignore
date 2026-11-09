@@ -1,0 +1,20 @@
+# Terraform local artifacts
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Local secrets and machine settings
+.env
+.env.*
+.claude/settings.local.json
+
+# Submission archive
+assessment-cc-agentic-devops-azure-terraform-sr-01.zip
